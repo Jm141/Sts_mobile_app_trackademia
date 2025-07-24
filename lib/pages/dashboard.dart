@@ -12,6 +12,12 @@ import 'family_billing_log.dart';
 import 'dart:async';
 import 'qr_scanner_page.dart';
 import 'teacher_attendance.dart';
+import '../services/data_persistence_service.dart';
+import 'dart:math';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 
 class DashboardPage extends StatefulWidget {
   final Map<String, dynamic>? userData;
@@ -33,18 +39,29 @@ class _DashboardPageState extends State<DashboardPage> {
   final LocationService _locationService = LocationService();
   bool _isTrackingEnabled = false;
   bool _isSimpleTrackingEnabled = false;
+  List<Map<String, dynamic>> _cachedLocations = [];
+  bool _isLoadingCache = false;
 
   @override
   void initState() {
     super.initState();
     _navigationItems = _getNavigationItems();
-
-    // Start location tracking if user is a student
     if (widget.userData?['access'] == 'student') {
+      _loadCachedLocations();
+      // Start location tracking if user is a student
       _initializeLocationTracking();
       // Automatically start simple tracking when app opens
       _startSimpleTracking();
     }
+  }
+
+  Future<void> _loadCachedLocations() async {
+    setState(() { _isLoadingCache = true; });
+    final locations = await DataPersistenceService.getLocationHistory();
+    setState(() {
+      _cachedLocations = locations;
+      _isLoadingCache = false;
+    });
   }
 
   Future<void> _initializeLocationTracking() async {
@@ -75,9 +92,9 @@ class _DashboardPageState extends State<DashboardPage> {
 
           print('Dashboard: Location tracking initialized successfully');
 
-          // Test the location sending immediately
+          // Test the location sending immediately (use always-cache-first method)
           print('Dashboard: Testing location sending');
-          await BackgroundService.testLocationSending();
+          await _locationService.getAndCacheAndSendLocation(email, userCode);
         } else {
           print('Dashboard: Missing email or userCode');
         }
@@ -604,27 +621,121 @@ class _DashboardPageState extends State<DashboardPage> {
                       child: Container(
                         color: Colors.grey[50]?.withOpacity(0.95),
                         padding: const EdgeInsets.all(16),
-                        child: Container(
-                          decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.95),
-                            borderRadius: BorderRadius.circular(8),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.05),
-                                blurRadius: 5,
-                                offset: const Offset(0, 2),
-                              ),
-                            ],
-                          ),
-                          child: Center(
-                            child: Text(
-                              'Welcome to ${_navigationItems[_selectedIndex].title}',
-                              style: const TextStyle(
-                                fontSize: 20,
-                                fontWeight: FontWeight.w300,
-                                color: Color(0xFF4CAF50),
-                              ),
-                            ),
+                        child: SingleChildScrollView(
+                          child: Builder(
+                            builder: (context) {
+                              final access = widget.userData?['access'];
+                              if (access == 'student') {
+                                return Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Text(
+                                      'Welcome, ${widget.userData?['name'] ?? 'Student'}!',
+                                      style: const TextStyle(
+                                        fontSize: 24,
+                                        fontWeight: FontWeight.w500,
+                                        color: Color(0xFF4CAF50),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 16),
+                                    const Text(
+                                      'Track your academic journey with Triconnect.',
+                                      style: TextStyle(fontSize: 16),
+                                    ),
+                                  ],
+                                );
+                              } else if (access == 'parent') {
+                                return FutureBuilder<List<Map<String, dynamic>>>(
+                                  future: _fetchFamilyLocations(),
+                                  builder: (context, snapshot) {
+                                    if (snapshot.connectionState == ConnectionState.waiting) {
+                                      return const Center(child: CircularProgressIndicator());
+                                    }
+                                    final locations = snapshot.data ?? [];
+                                    if (locations.isEmpty) {
+                                      return const Text('No student locations available.');
+                                    }
+                                    // Show the latest location on a map
+                                    final latest = locations.first;
+                                    final lat = double.tryParse(latest['lat'].toString()) ?? 0.0;
+                                    final lng = double.tryParse(latest['lng'].toString()) ?? 0.0;
+                                    return Column(
+                                      children: [
+                                        Text(
+                                          'Welcome, ${widget.userData?['name'] ?? 'Parent'}!',
+                                          style: const TextStyle(
+                                            fontSize: 24,
+                                            fontWeight: FontWeight.w500,
+                                            color: Color(0xFF4CAF50),
+                                          ),
+                                        ),
+                                        const SizedBox(height: 16),
+                                        const Text('Latest student location:'),
+                                        const SizedBox(height: 12),
+                                        SizedBox(
+                                          height: 300,
+                                          child: FlutterMap(
+                                            options: MapOptions(
+                                              initialCenter: LatLng(lat, lng),
+                                              initialZoom: 16.0,
+                                            ),
+                                            children: [
+                                              TileLayer(
+                                                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                                                userAgentPackageName: 'com.triconnect.app',
+                                              ),
+                                              MarkerLayer(
+                                                markers: [
+                                                  Marker(
+                                                    point: LatLng(lat, lng),
+                                                    width: 40,
+                                                    height: 40,
+                                                    child: const Icon(Icons.location_on, color: Colors.red, size: 40),
+                                                  ),
+                                                ],
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                        const SizedBox(height: 8),
+                                        Text('Student: ${latest['student_name'] ?? 'Unknown'}'),
+                                        Text('Time: ${latest['created_at'] ?? ''}'),
+                                      ],
+                                    );
+                                  },
+                                );
+                              } else if (access == 'teacher') {
+                                return FutureBuilder<int>(
+                                  future: _fetchTeacherStudentCount(),
+                                  builder: (context, snapshot) {
+                                    if (snapshot.connectionState == ConnectionState.waiting) {
+                                      return const Center(child: CircularProgressIndicator());
+                                    }
+                                    final count = snapshot.data ?? 0;
+                                    return Column(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Text(
+                                          'Welcome, ${widget.userData?['name'] ?? 'Teacher'}!',
+                                          style: const TextStyle(
+                                            fontSize: 24,
+                                            fontWeight: FontWeight.w500,
+                                            color: Color(0xFF4CAF50),
+                                          ),
+                                        ),
+                                        const SizedBox(height: 16),
+                                        Text(
+                                          'Number of students in the room: $count',
+                                          style: const TextStyle(fontSize: 18),
+                                        ),
+                                      ],
+                                    );
+                                  },
+                                );
+                              } else {
+                                return const Text('Welcome to Triconnect!');
+                              }
+                            },
                           ),
                         ),
                       ),
@@ -712,7 +823,8 @@ class _DashboardPageState extends State<DashboardPage> {
         final String userCode = widget.userData!['userCode'] ?? '';
 
         if (email.isNotEmpty && userCode.isNotEmpty) {
-          await BackgroundService.testLocationSending();
+          // Use the always-cache-first method
+          await _locationService.getAndCacheAndSendLocation(email, userCode);
         }
       }
     });
@@ -723,8 +835,39 @@ class _DashboardPageState extends State<DashboardPage> {
       final String userCode = widget.userData!['userCode'] ?? '';
 
       if (email.isNotEmpty && userCode.isNotEmpty) {
-        BackgroundService.testLocationSending();
+        // Use the always-cache-first method
+        _locationService.getAndCacheAndSendLocation(email, userCode);
       }
     }
+  }
+
+  // Add a helper to fetch latest student locations for parent
+  Future<List<Map<String, dynamic>>> _fetchFamilyLocations() async {
+    final userCode = widget.userData?['userCode'] ?? '';
+    if (userCode.isEmpty) return [];
+    final response = await http.get(
+      Uri.parse('https://stsapi.bccbsis.com/geofence_check.php?family_code=$userCode'),
+    );
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      if (data['geoLocationDetails'] != null) {
+        return List<Map<String, dynamic>>.from(data['geoLocationDetails']);
+      }
+    }
+    return [];
+  }
+
+  // Add a helper to fetch number of students in the room for teacher
+  Future<int> _fetchTeacherStudentCount() async {
+    final userCode = widget.userData?['userCode'] ?? '';
+    if (userCode.isEmpty) return 0;
+    final response = await http.get(
+      Uri.parse('https://stsapi.bccbsis.com/teacher_room_count.php?teacher_code=$userCode'),
+    );
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      return data['student_count'] ?? 0;
+    }
+    return 0;
   }
 }

@@ -4,6 +4,9 @@ import 'dart:convert';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'geofence_service.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'data_persistence_service.dart';
+import 'package:intl/intl.dart';
 
 class LocationService {
   static const String _locationPrefsKey = 'location_tracking_enabled';
@@ -59,63 +62,28 @@ class LocationService {
     return position;
   }
 
-  // Method to send the location data to the API
-  Future<void> sendLocationToApi(
-    Position position,
-    String email,
-    String userCode,
-  ) async {
-    try {
-      final String apiUrl = 'https://stsapi.bccbsis.com/location_service.php';
-
-      final Map<String, dynamic> locationData = {
-        'email': email,
-        'userCode': userCode,
-        'latitude': position.latitude,
-        'longitude': position.longitude,
-        'timestamp': position.timestamp.toIso8601String(),
-      };
-
-      final response = await http.post(
-        Uri.parse(apiUrl),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode(locationData),
-      );
-
-      if (response.statusCode == 200) {
-        print('Location sent successfully');
-        print('Response: ${response.body}');
-        
-        // Show notification for successful location update
-        await _showNotification(
-          'Location Update',
-          'Your location has been updated successfully.',
-        );
-        
-        // Check fence status using existing API data
-        await _checkFenceStatusFromAPI(userCode, email);
-      } else {
-        print('Failed to send location. Status code: ${response.statusCode}');
-        await _showNotification(
-          'Location Update Failed',
-          'Failed to update your location. Please check your connection.',
-        );
-      }
-    } catch (e) {
-      print('Error sending location: $e');
-      await _showNotification(
-        'Location Error',
-        'An error occurred while updating your location.',
-      );
-    }
+  // Helper to get Manila time formatted string
+  String _getManilaNowString() {
+    final now = DateTime.now().toUtc().add(const Duration(hours: 8)); // Manila is UTC+8
+    return DateFormat('yyyy-MM-dd HH:mm:ss').format(now);
   }
 
-  // Method to get location and send it to the API with user details
-  Future<void> getAndSendLocation(String email, String userCode) async {
+  // Method to get location and always cache, then sync if online
+  Future<void> getAndCacheAndSendLocation(String email, String userCode) async {
     try {
       Position? position = await getCurrentLocation();
       if (position != null) {
-        await sendLocationToApi(position, email, userCode);
+        final Map<String, dynamic> locationData = {
+          'email': email,
+          'userCode': userCode,
+          'latitude': position.latitude,
+          'longitude': position.longitude,
+          'timestamp': position.timestamp?.toIso8601String() ?? '', // GPS timestamp (optional)
+          'cached_at': _getManilaNowString(), // Manila time when cached
+        };
+        print('Always caching location: ${jsonEncode(locationData)}');
+        await DataPersistenceService.addLocationToHistory(locationData);
+        await syncCachedLocations();
       }
     } catch (e) {
       print('Error: $e');
@@ -124,19 +92,26 @@ class LocationService {
 
   // Method to start background location tracking
   Future<void> startBackgroundTracking(String email, String userCode) async {
-    // Save tracking state
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_locationPrefsKey, true);
-    
-    // Start background location updates using position stream
     Geolocator.getPositionStream(
       locationSettings: LocationSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 10, // Update every 10 meters
-        timeLimit: const Duration(minutes: 10), // Update every 10 minutes
+        distanceFilter: 10,
+        timeLimit: const Duration(minutes: 10),
       ),
     ).listen((Position position) async {
-      await sendLocationToApi(position, email, userCode);
+      final Map<String, dynamic> locationData = {
+        'email': email,
+        'userCode': userCode,
+        'latitude': position.latitude,
+        'longitude': position.longitude,
+        'timestamp': position.timestamp?.toIso8601String() ?? '', // GPS timestamp (optional)
+        'cached_at': _getManilaNowString(), // Manila time when cached
+      };
+      print('Always caching location (background): ${jsonEncode(locationData)}');
+      await DataPersistenceService.addLocationToHistory(locationData);
+      await syncCachedLocations();
     });
   }
 
@@ -204,5 +179,66 @@ class LocationService {
   // NEW: Start periodic fence checking for background monitoring
   Future<void> startPeriodicFenceChecking(String userCode, String email) async {
     await _geofenceService.startPeriodicFenceChecking(userCode, email);
+  }
+
+  // Remove a location from cache after successful sync
+  Future<void> _removeLocationFromCache(Map<String, dynamic> location) async {
+    final history = await DataPersistenceService.getLocationHistory();
+    history.removeWhere((item) =>
+      item['email'] == location['email'] &&
+      item['userCode'] == location['userCode'] &&
+      item['timestamp'] == location['timestamp']
+    );
+    await DataPersistenceService.saveLocationHistory(history);
+    print('Removed cached location after successful sync: ${jsonEncode(location)}');
+  }
+
+  // Method to sync cached locations when internet is available
+  Future<void> syncCachedLocations() async {
+    final connectivityResult = await Connectivity().checkConnectivity();
+    if (connectivityResult == ConnectivityResult.none) {
+      print('No internet connection. Skipping sync.');
+      return;
+    }
+    final cachedLocations = await DataPersistenceService.getLocationHistory();
+    if (cachedLocations.isEmpty) {
+      print('No cached locations to sync.');
+      return;
+    }
+    print('Syncing ${cachedLocations.length} cached locations...');
+    for (final location in List<Map<String, dynamic>>.from(cachedLocations)) {
+      try {
+        // Use cached_at as the timestamp for the API
+        final Map<String, dynamic> apiPayload = {
+          'email': location['email'],
+          'userCode': location['userCode'],
+          'latitude': location['latitude'],
+          'longitude': location['longitude'],
+          'timestamp': location['cached_at'],
+        };
+        final response = await http.post(
+          Uri.parse('https://stsapi.bccbsis.com/location_service.php'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode(apiPayload),
+        );
+        if (response.statusCode == 200) {
+          print('Synced cached location: ${location['cached_at']}');
+          await _removeLocationFromCache(location);
+        } else {
+          print('Failed to sync cached location: ${location['cached_at']}');
+        }
+      } catch (e) {
+        print('Error syncing cached location: ${e}');
+      }
+    }
+  }
+
+  // Listen for connectivity changes and sync when online
+  void listenForConnectivityAndSync() {
+    Connectivity().onConnectivityChanged.listen((ConnectivityResult result) async {
+      if (result != ConnectivityResult.none) {
+        await syncCachedLocations();
+      }
+    });
   }
 } 

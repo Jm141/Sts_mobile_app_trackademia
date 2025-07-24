@@ -5,6 +5,7 @@ import 'services/background_service.dart';
 import 'pages/splash_screen.dart';
 import 'pages/dashboard.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'services/location_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,6 +19,8 @@ void main() async {
     } catch (e) {
       print('Main: Failed to initialize background service: $e');
     }
+    // Start listening for connectivity changes to sync cached locations
+    LocationService().listenForConnectivityAndSync();
   } else {
     print('Main: Skipping background service initialization on web platform');
   }
