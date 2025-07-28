@@ -68,6 +68,7 @@ class _AddStudentPageState extends State<AddStudentPage> {
   void initState() {
     super.initState();
     _addNewStudentEntry();
+    _selectedSubscription = 'standard'; // Set default subscription
   }
 
   @override
@@ -239,11 +240,6 @@ class _AddStudentPageState extends State<AddStudentPage> {
   }
 
   Future<void> _submitForm() async {
-    if (_selectedSubscription == null) {
-      _showMessageDialog('Please select a subscription plan', false);
-      return;
-    }
-
     bool hasError = false;
     String errorMessage = '';
 
@@ -548,7 +544,7 @@ class _AddStudentPageState extends State<AddStudentPage> {
                 ElevatedButton(
                   onPressed: () {
                     if (_formKey.currentState!.validate()) {
-                      _showSubscriptionDialog();
+                      _submitForm();
                     }
                   },
                   style: ElevatedButton.styleFrom(
